@@ -9,7 +9,7 @@
 
 BAML meets **ALL critical requirements** and **MOST important requirements** for production validation and debugging. The framework provides comprehensive observability through its `Collector` API, detailed error reporting, full token/latency tracking, and flexible configuration options.
 
-**Key Finding:** SAP (Semantic Auto Prompting) was not found in the codebase - this may be a future feature or known by a different name.
+**Key Finding:** SAP (Schema Aligned Parsing) is fully implemented as BAML's core mechanism for injecting type schemas into prompts and validating LLM responses against those schemas.
 
 ---
 
@@ -32,14 +32,14 @@ BAML meets **ALL critical requirements** and **MOST important requirements** for
 
 | Criterion | Status | Implementation Details |
 |-----------|--------|------------------------|
-| **SAP transformations** | ❌ NO | No evidence of "Semantic Auto Prompting" found in codebase, documentation, or tests |
+| **SAP transformations** | ✅ YES | Schema Aligned Parsing visible via `ctx.output_format` in prompts, `httpRequest.body` shows schema injection, `BAML_LOG=info` shows transformations |
 | **All retry attempts** | ✅ YES | `FunctionLog.calls` array contains one `LlmCall` object per attempt, including failed retries |
 | **Error stage info** | ✅ YES | `ExposedError` enum distinguishes: `ValidationError` (parsing), `ClientHttpError` (LLM call), `BamlInvalidArgumentError` (composition), plus `FinishReasonError` and `TimeoutError` |
 | **Can disable retries** | ✅ YES | Omit `retry_policy` from client config, or set `max_retries 0` |
-| **Can disable SAP** | ❌ N/A | SAP feature not found in codebase |
+| **Can disable SAP** | ⚠️ PARTIAL | Cannot fully disable (core to BAML), but can customize via `ctx.output_format(prefix="...")` or exclude from prompts (manual prompt mode) |
 | **Pass Anthropic params** | ✅ YES | All options in `client { options { } }` block are passed directly to API - supports `temperature`, `top_p`, `max_tokens`, custom `headers`, `thinking` config, etc. |
 
-**Verdict:** 4/6 ✅ **PASS** (excluding N/A SAP items: 4/4)
+**Verdict:** 5.5/6 ✅ **PASS** (SAP transformations visible, disable partially supported)
 
 ---
 
@@ -373,7 +373,146 @@ class Resume {
 
 ---
 
-### 9. Cost Tracking
+### 9. Schema Aligned Parsing (SAP) Transformations
+
+**What is SAP:**
+Schema Aligned Parsing is BAML's core mechanism that:
+1. Automatically injects your type schemas (classes/enums) into prompts
+2. Validates and parses LLM responses against those schemas
+3. Provides type-safe outputs with automatic coercion
+
+**Viewing SAP Transformations:**
+
+```typescript
+// Method 1: Via Collector - See schema in composed prompt
+const collector = new Collector("sap-demo")
+await b.ExtractResume(resumeText, { collector })
+
+const request = collector.last?.calls[0].httpRequest
+const messages = request?.body.json().messages
+
+// The schema is injected into the prompt automatically
+console.log(JSON.stringify(messages, null, 2))
+// Output shows schema definition in the prompt messages
+```
+
+```bash
+# Method 2: Via BAML_LOG environment variable
+BAML_LOG=info node app.js
+
+# Output shows:
+# [BAML] Prompt: <full prompt with schema>
+# [BAML] Raw Output: <LLM response>
+# [BAML] Parsed: <validated typed output>
+```
+
+**BAML Schema Injection:**
+
+```baml
+class Resume {
+  name string
+  email string
+  skills string[]
+}
+
+function ExtractResume(resume_text: string) -> Resume {
+  client GPT4
+  prompt #"
+    Extract information from this resume:
+
+    {{ resume_text }}
+
+    {{ ctx.output_format }}
+  "#
+}
+```
+
+The `{{ ctx.output_format }}` template variable gets replaced with:
+```
+Answer in JSON using this schema:
+{
+  name: string,
+  email: string,
+  skills: string[]
+}
+```
+
+**Customizing SAP Behavior:**
+
+```baml
+function ExtractResume(resume_text: string) -> Resume {
+  prompt #"
+    {{ resume_text }}
+
+    // Custom prefix
+    {{ ctx.output_format(prefix="Return JSON:\n") }}
+
+    // Always inline enums instead of references
+    {{ ctx.output_format(always_hoist_enums=true) }}
+  "#
+}
+```
+
+**Viewing Validation Errors:**
+
+```typescript
+try {
+    await b.ExtractResume(text)
+} catch (error: any) {
+    if (error instanceof BamlValidationError) {
+        console.log("Schema validation failed!")
+        console.log(`Prompt sent: ${error.prompt}`)
+        console.log(`Raw LLM output: ${error.raw_output}`)
+        console.log(`Validation error: ${error.message}`)
+
+        // Shows exactly what SAP expected vs what it got
+        console.log(error.detailed_message)
+    }
+}
+```
+
+**Partial Disable / Bypass Options:**
+
+While SAP cannot be fully disabled (it's core to BAML), you can:
+
+1. **Use looser types:**
+```baml
+class FlexibleOutput {
+  data string  // Accept any string instead of structured data
+}
+```
+
+2. **Manual prompt mode (exclude ctx.output_format):**
+```baml
+function RawPrompt(input: string) -> string {
+  prompt #"
+    {{ input }}
+    // No ctx.output_format = minimal schema enforcement
+  "#
+}
+```
+
+3. **Access raw response before parsing:**
+```typescript
+const collector = new Collector()
+try {
+    await b.Function(input, { collector })
+} catch {
+    // Even on parse failure, raw response is available
+    const raw = collector.last?.rawLlmResponse
+    console.log(`Raw (unparsed): ${raw}`)
+}
+```
+
+**Files:**
+- Schema injection: `engine/baml-runtime/src/internal/prompt_renderer/render_output_format.rs`
+- Response parsing: `engine/baml-lib/jsonish/src/deserializer/coercer/mod.rs`
+- Output format docs: `fern/03-reference/baml/prompt-syntax/output-format.mdx`
+- Terminal logs: `fern/01-guide/03-development/terminal-logs.mdx`
+
+---
+
+### 10. Cost Tracking
 
 ```typescript
 const collector = new Collector("cost-tracking")
@@ -430,11 +569,12 @@ await b.Function(input, {
 
 ## Limitations & Considerations
 
-### SAP (Semantic Auto Prompting) - Not Found
-- No evidence of SAP feature in current codebase (as of commit `46f016e`)
-- May be planned for future release or known by different terminology
-- **Impact:** Cannot test "what transformations SAP applied" or "disable SAP"
-- **Recommendation:** Ask BAML team about SAP roadmap or alternative naming
+### SAP (Schema Aligned Parsing) - Core Feature
+- **Fully Implemented** as BAML's foundational mechanism for type-safe LLM outputs
+- Cannot be fully disabled (it's the core value proposition of BAML)
+- **Visibility:** Complete - view via `Collector.httpRequest.body`, `BAML_LOG=info`, or `BamlValidationError` details
+- **Customization:** Via `ctx.output_format(prefix="...", always_hoist_enums=true)` parameters
+- **Workaround for bypass:** Use `string` return type and exclude `ctx.output_format` from prompt for minimal enforcement
 
 ### Dry-Run Mode - Partial
 - Parser object is accessible via `b.parse`
@@ -475,8 +615,8 @@ await b.Function(input, {
 - Strong observability through Collector API and onTick hooks
 - Zero abstraction loss - all raw data accessible
 
-**Acceptable Gaps:**
-- SAP feature not found (may not be needed for validation use case)
+**Minor Limitations:**
+- SAP cannot be fully disabled (but this is by design - it's BAML's core value)
 - Dry-run mode requires workaround (not critical)
 - Template introspection partial (workaround available)
 
@@ -531,6 +671,23 @@ try {
 // 8. ✅ Anthropic parameters
 // (Verify via httpRequest.body)
 assert(collector.last?.calls[0].httpRequest.body.json().temperature === 0.7)
+
+// 9. ✅ SAP (Schema Aligned Parsing) transformations
+// (Verify schema is injected into prompt)
+const messages = collector.last?.calls[0].httpRequest.body.json().messages
+const promptText = JSON.stringify(messages)
+assert(promptText.includes('name') && promptText.includes('string'))  // Schema visible in prompt
+
+// 10. ✅ SAP validation errors
+try {
+    await b.ExtractStructuredData("invalid data that won't parse")
+} catch (error) {
+    if (error instanceof BamlValidationError) {
+        assert(error.prompt)        // Original prompt with schema
+        assert(error.raw_output)    // LLM's response
+        assert(error.message)       // What went wrong
+    }
+}
 ```
 
 ---
